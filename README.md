@@ -3,13 +3,17 @@
 In this repository, we present the first self-driving MRI system for fetal brain imaging.
 
 <br />
+
 ![Sequence](images/interleaved.png)
+
 <br />
 
 To mitigate motion effects in fetal neuroimaging (T2-weighted 2D HASTE MRI slices), we adaptively rotate/translate imaging plane of each slice to account for the current fetal head pose, which is robustly estimated from fast, low-resolution 3D echo-planar imaging volumetric navigators (EPI-vNavs) interleaved between consecutive HASTE readouts<sup>1</sup> using E(3)-Pose<sup>2</sup>. We also translate the field-of-view (FOV) of every EPI-vNav based on the current pose, such that the FOV is centered around the head.
 
 <br />
+
 ![Feedback loop](images/feedback.png)
+
 <br />
 
 We present a real-time feedback loop system for automated prescription of imaging slices that account for the fetal head motion in real time. Our implementation employs an interleaved sequence running on a 3T Siemens scanner, connected to a server hosted on a GPU-enabled laptop, using existing software<sup>3</sup> to facilitate communication between the server and the scanner. We have evaluated our implementation on a phantom and have conducted preliminary evaluations *in utero*.
