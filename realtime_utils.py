@@ -4,6 +4,7 @@ import torch
 import torchio
 from scipy.ndimage import center_of_mass
 from scipy.spatial.transform import Rotation
+import time
 
 import networks
 import utils
@@ -51,15 +52,15 @@ def init_canonical(slice_pos, ori='axial'):
         ])
     elif ori == 'sagittal':
         R = np.array([
-                [-1., 0., 0.,],
-                [0., 0., 1.],
+                [0., 0., -1.,],
+                [1., 0., 0.],
                 [0., -1., 0.]
         ])
     else:
         R = np.array([
-                [0., 0., -1.,],
-                [1., 0., 0.],
-                [0., 1., 0.]
+                [-1., 0., 0.,],
+                [0., 0., -1.],
+                [0., -1., 0.]
         ])
     slice_pos_vec = np.array([0.,0.,slice_pos])
     t = R @ slice_pos_vec
@@ -81,8 +82,9 @@ def run_unet(vnav, net):
     fov_center = np.array(center_of_mass(np.ones_like(lab_pred_np))).astype(np.float32)
     trans_pred = brain_center_pred-fov_center # IN NAVIGATOR COORD SYSTEM
     trans_scanner = preproc_aff[:3,:3] @ trans_pred # IN SCANNER COORD SYSTEM
+    brain_center_pred_scanner = preproc_aff[:3,:3] @ brain_center_pred + preproc_aff[:3,3]
 
-    return trans_scanner, img, lab_pred, preproc_aff
+    return trans_scanner, img, lab_pred, brain_center_pred_scanner, preproc_aff
 
 def run_e3cnn(img, pred_seg, vnav_aff, net, slice_pos, ori, brain_center, ras2sdcs):
     slice_rot_head, slice_trans_head = init_canonical(slice_pos=slice_pos,ori=ori) # SLICE POSE IN HEAD COORD SYSTEM
@@ -94,14 +96,21 @@ def run_e3cnn(img, pred_seg, vnav_aff, net, slice_pos, ori, brain_center, ras2sd
         cropped_img_transformed = cropped_img_transformed.tensor.unsqueeze(0).to(torch.float32).to(device)
         ecnn_pred = net.forward(cropped_img_transformed)
         rot_pred = utils.postprocess_rotation(ecnn_pred) # HEAD POSE IN NAVIGATOR COORD SYSTEM
+        
         # rot_pred = Rotation.from_euler('xyz', np.random.uniform(-20, 20, size=(3,)), degrees=True).as_matrix() @ utils.get_rot_from_aff(np.linalg.inv(vnav_aff[:3,:3])) # FOR DEBUGGING
+        # rot_pred = utils.get_rot_from_aff(np.linalg.inv(vnav_aff[:3,:3])) # FOR DEBUGGING
 
     rot_pred_scanner = utils.get_rot_from_aff(vnav_aff[:3,:3]) @ rot_pred # HEAD POSE IN SCANNER COORD SYSTEM
     slice_rot_prescribe = rot_pred_scanner @ slice_rot_head # SLICE ROTATION IN SCANNER COORD SYSTEM
     
     # brain_center = np.array([0,0,0]) # FOR DEBUGGING
-    slice_trans_prescribe = brain_center + slice_rot_prescribe @ slice_trans_head # SLICE TRANSLATION IN SCANNER COORDINATE SYSTEM
+    slice_trans_prescribe = brain_center + rot_pred_scanner @ slice_trans_head # SLICE TRANSLATION IN SCANNER COORDINATE SYSTEM
     
     slice_rot_send, slice_trans_send = utils.scanner_to_vsend(slice_rot_prescribe, slice_trans_prescribe, ras2sdcs)
 
     return slice_rot_send, slice_trans_send, rot_pred
+
+def run_qa_cnn(slice, slice_pos):
+    # TODO: return network-generated slice quality assessment
+    qa = 1.0
+    return qa

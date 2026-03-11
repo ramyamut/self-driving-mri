@@ -38,7 +38,6 @@ def convert_translation(t_vox, affine, spacing):
     
 def preprocess(img, aff):
     # read image and corresponding info
-    # lab_fov = torchio.ScalarImage(tensor=torch.tensor(img).unsqueeze(0), affine=aff)
     img = torchio.ScalarImage(tensor=torch.tensor(img).unsqueeze(0), affine=aff)
     resample = torchio.transforms.Resample(target=3.)
     croporpad = torchio.transforms.CropOrPad(target_shape=128)
@@ -51,7 +50,6 @@ def preprocess(img, aff):
     new_aff = img_transformed.affine
     img_transformed = img_transformed.tensor.unsqueeze(0).float()
 
-    # return img_transformed, lab_fov.squeeze().numpy(), new_aff
     return img_transformed, new_aff
 
 def crop_around_brain_scale(image, brain_bbox, scale=0.6):
@@ -89,7 +87,12 @@ def preprocess_rot_final(vol, label, scale=0.6, resize=[64,64,64]):
     shape *= np.array(resize) / np.max(shape)
     shape = np.round(np.array(shape)).astype(np.int32)
     resize = torchio.transforms.Compose([torchio.Resize(tuple(shape)), torchio.transforms.RescaleIntensity()])
-    vol_rolled = resize(torchio.ScalarImage(tensor=torch.tensor(vol_rolled).unsqueeze(0))).tensor.squeeze().unsqueeze(-1).numpy()
+    resize64 = torchio.transforms.Compose([torchio.Resize(64), torchio.transforms.RescaleIntensity()])
+    try:
+        vol_rolled = resize(torchio.ScalarImage(tensor=torch.tensor(vol_rolled).unsqueeze(0))).tensor.squeeze().unsqueeze(-1).numpy()
+    except:
+        print('cropping error')
+        vol_rolled = resize64(torchio.ScalarImage(tensor=torch.tensor(vol).unsqueeze(0))).tensor.squeeze().unsqueeze(-1).numpy()  
 
     return vol_rolled
 
@@ -195,10 +198,10 @@ def scanner_to_vsend(rot_mat_scanner, slice_center_scanner, ras2sdcs):
     if not sign_ori:
         pe *= -1
     vsend_rot = np.stack([pe, ro, sl], axis=1)
-    vsend_t = vsend_rot.T@ras2sdcs@(slice_center_scanner+np.array([0.,0.,7.]))
+    vsend_t = vsend_rot.T@ras2sdcs@slice_center_scanner
     return vsend_rot, vsend_t
 
-def vsend_to_scanner(vsend_rot, vsend_t, voxToWorldRot, voxel_res, ras2sdcs):
+def vsend_to_scanner(vsend_rot, vsend_t, voxToWorldRot, ras2sdcs):
     sdcs2ras = np.linalg.inv(ras2sdcs)
     main_ori = np.argmax(np.abs(voxToWorldRot[:,2]))
     sign_ori = voxToWorldRot[main_ori,2] > 0
@@ -208,7 +211,7 @@ def vsend_to_scanner(vsend_rot, vsend_t, voxToWorldRot, voxel_res, ras2sdcs):
     
     if not sign_ori:
         pe *= -1
-        dro *= -1
+        # dro *= -1
     if main_ori == 0: # SAGITTAL
         X = -sdcs2ras@pe
         Y = -sdcs2ras@ro
@@ -220,7 +223,7 @@ def vsend_to_scanner(vsend_rot, vsend_t, voxToWorldRot, voxel_res, ras2sdcs):
         X = -sdcs2ras@ro
         Y = sdcs2ras@pe
     rot_mat_scanner = np.stack([X, Y, Z], axis=1)
-    slice_center_scanner = sdcs2ras@vsend_rot@vsend_t-np.array([0.,0.,7.])
+    slice_center_scanner = sdcs2ras@vsend_rot@vsend_t
     return rot_mat_scanner, slice_center_scanner
 
 def adjust_slice_t(old_slice, new_rot, center):

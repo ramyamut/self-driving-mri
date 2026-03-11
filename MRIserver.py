@@ -138,9 +138,9 @@ class ImageReceiver(Server):
 
         # init acquisition params
         self.slice_thickness = 3.
-        self.ori = 'axial'
+        self.ori = 'coronal'
         self.patient_position = 'SUP'
-        self.num_slices = 25
+        self.num_slices = 32
         self.slice_zs_ordered = np.arange(0,self.num_slices)*self.slice_thickness # - (self.slice_thickness-1)/2
         self.slice_zs_ordered -= self.slice_zs_ordered.mean()
         self.slice_zs = []
@@ -152,17 +152,18 @@ class ImageReceiver(Server):
             self.slice_zs += self.slice_zs_ordered[list(range(sweep, self.num_slices, self.n_sweeps))].tolist()
         print(self.anatomical_idxs)
         print(self.slice_zs)
+        self.qa = 1.0
 
         # init networks
         unet_path = "models/unet_128.ckpt"
         self.unet = realtime_utils.init_unet(unet_path)
         e3cnn_path = "models/e3cnn.pth"
         self.e3cnn = realtime_utils.init_e3cnn(e3cnn_path)
-        self.vnav_t_send = np.array([0., 0., 0.])
+        self.nav_FOV_center_send = np.array([0., 0., 0.])
         for _ in range(5):
             start1 = time()
             dummy_img = nb.Nifti1Image(np.random.uniform(size=(54,54,20)), np.diag([6,6,6,1]))
-            _, img_input, pred_seg, _ = realtime_utils.run_unet(dummy_img, self.unet)
+            _, img_input, pred_seg, _, _ = realtime_utils.run_unet(dummy_img, self.unet)
             _ = realtime_utils.run_e3cnn(img_input, pred_seg, dummy_img.affine, self.e3cnn, 0, 'axial', dummy_img.affine[:3,3], LPS2SDCS[self.patient_position]@RAS2LPS)
             end2 = time()
             print(f"Total time: {end2-start1}")
@@ -260,23 +261,21 @@ class ImageReceiver(Server):
                 new_ei not in self.imagestore):
                 self.imagestore.append(new_ei)
                 if vnav:
+                    print(f"Received navigator #{self.counter_vNav:03}")
                     if self.vnav0 is None:
                         self.vnav0 = new_ei
                     nav_FOV_center_curr = new_ei.affine[:3,3] - self.vnav0.affine[:3,3]
-                    pred_trans, img_input, pred_seg, proc_aff = realtime_utils.run_unet(new_ei, self.unet)
+                    pred_trans, img_input, pred_seg, brain_center_pred_scanner, proc_aff = realtime_utils.run_unet(new_ei, self.unet)
                     nav_FOV_center_prescribe = nav_FOV_center_curr + pred_trans
                     self.nav_FOV_center_send = LPS2SDCS[self.patient_position]@RAS2LPS@nav_FOV_center_prescribe
                     clip = 199.9
                     if np.linalg.norm(self.nav_FOV_center_send) > clip:
                         self.nav_FOV_center_send = self.nav_FOV_center_send / np.linalg.norm(self.nav_FOV_center_send) * clip
                     
-                    self.slice_rot_send, self.slice_trans_send, nav_rot_pred = realtime_utils.run_e3cnn(img_input, pred_seg, new_ei.affine, self.e3cnn, self.slice_pos, self.ori, nav_FOV_center_curr, LPS2SDCS[self.patient_position]@RAS2LPS)
-                    self.qa = 1.0
+                    self.slice_rot_send, self.slice_trans_send, nav_rot_pred = realtime_utils.run_e3cnn(img_input, pred_seg, new_ei.affine, self.e3cnn, self.slice_pos, self.ori, brain_center_pred_scanner, LPS2SDCS[self.patient_position]@RAS2LPS)
                     result = tuple(self.nav_FOV_center_send.tolist() + self.slice_trans_send.tolist() + self.slice_rot_send.flatten().tolist() + [self.qa])
                     self.shared_data.put("vNav", (result, self.counter_vNav))
-                    self.counter_vNav += 1
                     
-                    # print(f"HASTE ROT SEND: {self.haste_rot_send}")
 
                     save_nifti(nb.Nifti1Image(img_input.detach().cpu().squeeze().numpy(), proc_aff), "INPUT", self.save_location, hdr.seriesUID, self.counter_vNav)
                     save_nifti(nb.Nifti1Image(pred_seg.float().detach().cpu().squeeze().numpy(), proc_aff), "MASK", self.save_location, hdr.seriesUID, self.counter_vNav)
@@ -285,21 +284,24 @@ class ImageReceiver(Server):
                     save_npy(nav_rot_pred, 'nav_rot_pred', self.save_location, hdr.seriesUID, self.counter_vNav)
                     save_npy(self.slice_rot_send, 'slice_rot_send', self.save_location, hdr.seriesUID, self.counter_vNav)
                     save_npy(self.slice_trans_send, 'slice_trans_send', self.save_location, hdr.seriesUID, self.counter_vNav)
+                    save_nifti(new_ei, imgtype, self.save_location, hdr.seriesUID, self.counter_vNav)
+                    self.counter_vNav += 1
                     
                 else:
+                    print(f"Received slice #{self.counter_HASTE:03}")
                     if hdr.iSliceAnatomicalIndex == 0:
                         self.stack_affine = new_ei.affine
-                        # print(self.stack_affine)
                     self.stack[hdr.iSliceAnatomicalIndex] = new_ei.get_fdata().squeeze()
-                    self.counter_HASTE += 1
+                    self.qa = realtime_utils.run_qa_cnn(new_ei, self.slice_pos)
 
                     voxel_res = np.diag([1.25,1.25,3])
                     prescribed_aff = new_ei.affine
-                    new_slice_rot, new_slice_center = utils.vsend_to_scanner(self.slice_rot_send, self.slice_trans_send, np.copy(prescribed_aff[:3,:3]), voxel_res, LPS2SDCS[self.patient_position]@RAS2LPS)
+                    new_slice_rot, new_slice_center = utils.vsend_to_scanner(self.slice_rot_send, self.slice_trans_send, np.copy(prescribed_aff[:3,:3]), LPS2SDCS[self.patient_position]@RAS2LPS)
                     new_slice_rot = new_slice_rot @ voxel_res
                     new_slice_aff = utils.adjust_slice_t(new_ei, new_slice_rot, new_slice_center)
                     new_ei = nb.Nifti1Image(new_ei.get_fdata(), new_slice_aff)
-                save_nifti(new_ei, imgtype, self.save_location, hdr.seriesUID, self.counter_vNav)
+                    self.counter_HASTE += 1
+                    save_nifti(new_ei, imgtype, self.save_location, hdr.seriesUID, self.counter_HASTE)
                 # save_npy(new_ei.get_fdata(), imgtype, self.save_location, hdr.seriesUID, self.counter_vNav)
 
 
