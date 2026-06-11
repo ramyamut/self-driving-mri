@@ -1,10 +1,23 @@
 import torch
 import torchio
 import numpy as np
+import nibabel as nib
+import os
+from scipy.ndimage import center_of_mass
 from skimage.measure import label
 
 thresh = 0.9
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+RAS2LPS = np.diag(np.array([-1.,-1.,1.]))
+LPS2SDCS = {
+    "SUP": np.diag(np.array([1.,-1.,-1.])), # supine
+    "LL": np.array([
+        [0., -1., 0.],
+        [-1., 0., 0.],
+        [0., 0., -1]
+    ]), # left lateral
+}
 
 def get_rot_from_aff(aff):
     rot = np.copy(aff[:3,:3])
@@ -97,8 +110,9 @@ def preprocess_rot_final(vol, label, scale=0.6, resize=[64,64,64]):
     return vol_rolled
 
 def postprocess(raw_pred, img, thresh=0.15):
-    
-    raw_pred = raw_pred[0].detach().cpu()
+    import time
+    start = time.time()
+    raw_pred = raw_pred[0]
     # threshold posteriors
     raw_pred[0, raw_pred[0] <= thresh] = 0
     raw_pred[1, raw_pred[1] <= 0.8] = 0
@@ -108,8 +122,11 @@ def postprocess(raw_pred, img, thresh=0.15):
     mask = mask.cpu().numpy()
     processed_mask = get_largest_cc((mask==1))
     out = torch.tensor(processed_mask).unsqueeze(0)
-    out[img[0] == 0] = 0
-    return out.detach().cpu()
+    padding_mask = (img[0]==0).cpu()
+    out[padding_mask] = 0
+    end = time.time()
+    # print(f"SEGMENTATION POSTPROCESSING TIME: {end-start}")
+    return out
 
 def axes_to_rotation(xax, yax, zax):
     xfm1 = torch.stack([torch.eye(3)]*xax.shape[0], dim=0)
@@ -182,49 +199,101 @@ def init_canonical_translation(slice_pos, ori='axial'):
     else:
         return np.array([0,slice_pos,0])
 
-def scanner_to_vsend(rot_mat_scanner, slice_center_scanner, ras2sdcs):
-    main_ori = np.argmax(np.abs(rot_mat_scanner[:,2]))
-    sign_ori = rot_mat_scanner[main_ori,2] > 0
-    sl = ras2sdcs@rot_mat_scanner[:,2]
-    if main_ori == 0: # SAGITTAL
-        pe = -ras2sdcs@rot_mat_scanner[:,0]
-        ro = -ras2sdcs@rot_mat_scanner[:,1]
-    elif main_ori == 1: # CORONAL
-        pe = -ras2sdcs@rot_mat_scanner[:,0]
-        ro = ras2sdcs@rot_mat_scanner[:,1]
-    else: # AXIAL
-        pe = ras2sdcs@rot_mat_scanner[:,1]
-        ro = -ras2sdcs@rot_mat_scanner[:,0]
-    if not sign_ori:
-        pe *= -1
-    vsend_rot = np.stack([pe, ro, sl], axis=1)
-    vsend_t = vsend_rot.T@ras2sdcs@slice_center_scanner
-    return vsend_rot, vsend_t
+def scanner_to_vsend(slice_rot_scanner, slice_center_scanner, patient_position):
+    ras2sdcs = LPS2SDCS[patient_position]@RAS2LPS #SCANNER2PATIENT
+    slice_rot_patient = ras2sdcs@slice_rot_scanner # SLICE TO PATIENT COORDINATE SYSTEM, ROTATION 
+    slice_center_patient = ras2sdcs@slice_center_scanner # SLICE CENTER RELATIVE TO PATIENT COORDINATE SYSTEM
+    sl = slice_rot_patient[:,2]
 
-def vsend_to_scanner(vsend_rot, vsend_t, voxToWorldRot, ras2sdcs):
-    sdcs2ras = np.linalg.inv(ras2sdcs)
-    main_ori = np.argmax(np.abs(voxToWorldRot[:,2]))
-    sign_ori = voxToWorldRot[main_ori,2] > 0
-    Z = sdcs2ras@vsend_rot[:,2]
-    pe = vsend_rot[:,0]
-    ro = vsend_rot[:,1]
+    main_ori = np.argmax(np.abs(slice_rot_patient[:,2]))
+    sign_ori = slice_rot_patient[main_ori,2] > 0
+
+    if main_ori == 0: # SAGITTAL RELATIVE TO PATIENT
+        pe = slice_rot_patient[:,0]
+        ro = -slice_rot_patient[:,1]
+    elif main_ori == 1: # CORONAL RELATIVE TO PATIENT
+        pe = -slice_rot_patient[:,0]
+        ro = slice_rot_patient[:,1]
+    else: # AXIAL RELATIVE TO PATIENT
+        pe = -slice_rot_patient[:,1]
+        ro = -slice_rot_patient[:,0]
     
     if not sign_ori:
         pe *= -1
-        # dro *= -1
-    if main_ori == 0: # SAGITTAL
-        X = -sdcs2ras@pe
-        Y = -sdcs2ras@ro
+    slice_gradients_patient = np.stack([pe, ro, sl], axis=1) # SLICE GRADIENTS RELATIVE TO PATIENT
+    dgradients = slice_gradients_patient.T@slice_center_patient # ORIGIN OF GRADIENT COORDINATE SYSTEM RELATIVE TO PATIENT
+    dpe = dgradients[0]
+    dro = dgradients[1]
+    dsl = dgradients[2]
+    vsend_t = np.array([dro, dpe, dsl])
+    return slice_gradients_patient, vsend_t
 
-    elif main_ori == 1: # CORONAL
-        X = -sdcs2ras@pe
-        Y = sdcs2ras@ro
-    else: # AXIAL
-        X = -sdcs2ras@ro
-        Y = sdcs2ras@pe
-    rot_mat_scanner = np.stack([X, Y, Z], axis=1)
-    slice_center_scanner = sdcs2ras@vsend_rot@vsend_t
-    return rot_mat_scanner, slice_center_scanner
+def scanner_to_vsend_NEW(slice_rot_scanner, slice_center_scanner, patient_position):
+    ras2sdcs = LPS2SDCS[patient_position]@RAS2LPS #SCANNER2PATIENT
+    slice_rot_patient = ras2sdcs@slice_rot_scanner # SLICE TO PATIENT COORDINATE SYSTEM, ROTATION 
+    slice_center_patient = ras2sdcs@slice_center_scanner # SLICE CENTER RELATIVE TO PATIENT COORDINATE SYSTEM
+    slice_center_slice = slice_rot_scanner.T@slice_center_scanner # SLICE CENTER RELATIVE TO SLICE COORDINATE SYSTEM
+    sl = slice_rot_patient[:,2]
+    shift_sl = slice_center_slice[2]
+
+    main_ori = np.argmax(np.abs(slice_rot_patient[:,2]))
+    sign_ori = slice_rot_patient[main_ori,2] > 0
+
+    if main_ori == 0: # SAGITTAL RELATIVE TO PATIENT
+        pe = slice_rot_patient[:,0]
+        ro = -slice_rot_patient[:,1]
+        shift_pe = slice_center_slice[0]
+        shift_ro = -slice_center_slice[1]
+    elif main_ori == 1: # CORONAL RELATIVE TO PATIENT
+        pe = -slice_rot_patient[:,0]
+        ro = -slice_rot_patient[:,1]
+        shift_pe = -slice_center_slice[0]
+        shift_ro = -slice_center_slice[1]
+    else: # AXIAL RELATIVE TO PATIENT
+        pe = -slice_rot_patient[:,1]
+        ro = -slice_rot_patient[:,0]
+        shift_pe = -slice_center_slice[1]
+        shift_ro = -slice_center_slice[0]
+    
+    if not sign_ori:
+        pe *= -1
+        shift_pe *= -1
+    slice_gradients_patient = np.stack([pe, ro, sl], axis=1) # SLICE GRADIENT DIRECTIONS RELATIVE TO PATIENT
+    vsend_t = np.array([shift_ro, shift_pe, shift_sl])
+    return slice_gradients_patient, vsend_t
+
+def vsend_to_scanner(slice_gradients_patient, vsend_t, slice_prescribed, patient_position):
+    slice_affine_scanner = slice_prescribed.affine
+    shift_ro = vsend_t[0]
+    shift_pe = vsend_t[1]
+    shift_sl = vsend_t[2]
+    dgradients = np.array([shift_pe, shift_ro, shift_sl])
+    slice_rot_scanner = get_rot_from_aff(slice_affine_scanner)
+    ras2sdcs = LPS2SDCS[patient_position]@RAS2LPS #SCANNER2PATIENT
+    slice_rot_patient = ras2sdcs@slice_rot_scanner # SLICE TO PATIENT COORDINATE SYSTEM, ROTATION
+    slice_center_patient = slice_gradients_patient@dgradients
+    slice_center_scanner1 = np.linalg.inv(ras2sdcs)@slice_center_patient
+    slice_center_slice = np.array([0.,0.,shift_sl])
+
+    main_ori = np.argmax(np.abs(slice_rot_patient[:,2]))
+    sign_ori = slice_rot_patient[main_ori,2] > 0
+
+    if not sign_ori:
+        shift_pe *= -1
+
+    if main_ori == 0: # SAGITTAL RELATIVE TO PATIENT
+        slice_center_slice[0] = shift_pe
+        slice_center_slice[1] = -shift_ro
+    elif main_ori == 1: # CORONAL RELATIVE TO PATIENT
+        slice_center_slice[0] = -shift_pe
+        slice_center_slice[1] = -shift_ro
+    else: # AXIAL RELATIVE TO PATIENT
+        slice_center_slice[1] = -shift_pe
+        slice_center_slice[0] = -shift_ro
+    
+    slice_center_scanner2 = slice_rot_scanner@slice_center_slice
+    new_affine = adjust_slice_t(slice_prescribed, slice_affine_scanner[:3,:3], slice_center_scanner1)
+    return new_affine
 
 def adjust_slice_t(old_slice, new_rot, center):
     new_affine = np.eye(4)
@@ -234,3 +303,239 @@ def adjust_slice_t(old_slice, new_rot, center):
     new_affine[:3,3] = new_t
     return new_affine
 
+def compute_crop_margins(mask, margin=5):
+
+    nonzero = torch.nonzero(mask, as_tuple=False)  # (N, 3)
+
+    mins = nonzero.min(dim=0).values
+    maxs = nonzero.max(dim=0).values
+    D, H, W = mask.shape
+
+    w0, w1 = max(mins[0].item() - margin, 0), min(maxs[0].item() + margin + 1, D)
+    h0, h1 = max(mins[1].item() - margin, 0), min(maxs[1].item() + margin + 1, H)
+    d0, d1 = max(mins[2].item() - margin, 0), min(maxs[2].item() + margin + 1, W)
+
+    slices = (min(w0, W-w1), min(h0, H-h1), min(d0, D-d1))
+
+    return slices
+
+def distance_to_slice_voxelgrid(volume_shape, affine, plane_point, plane_normal):
+    D, H, W = volume_shape
+    d = torch.arange(D, dtype=torch.float32).to(device)
+    h = torch.arange(H, dtype=torch.float32).to(device)
+    w = torch.arange(W, dtype=torch.float32).to(device)
+    grid_d, grid_h, grid_w = torch.meshgrid(d, h, w, indexing="ij")
+
+    ones = torch.ones_like(grid_d)
+    vox_coords = torch.stack([grid_d, grid_h, grid_w, ones], dim=-1)
+
+    world_coords = vox_coords @ affine.T
+    world_xyz    = world_coords[..., :3]
+
+    diff  = world_xyz - plane_point
+    dist  = (diff * plane_normal).sum(dim=-1)
+
+    return dist
+    
+class AcquisitionState:
+    def __init__(self, mask, rotation):
+        self.rotation = rotation
+        pose = np.eye(4)
+        pose[:3,:3] = rotation
+        pose[:3,3] = np.array(center_of_mass(mask.tensor.squeeze().cpu().numpy()))
+        t = np.eye(4)
+        t[:3,3] = -(np.array(mask.tensor.squeeze().shape)-1)/2
+
+        resample = torchio.transforms.Resample((mask.tensor.squeeze().shape, mask.affine@pose@t))
+        resampled = resample(mask)
+
+        # INITIALIZE MAPS
+        margins = compute_crop_margins(resampled.tensor.squeeze())
+        transform = torchio.transforms.Compose([
+            torchio.transforms.Crop(margins),
+            torchio.transforms.Resample(target=1.)
+        ])
+        self.mask = transform(resampled)
+        self.affine = self.mask.affine
+        self.mask = self.mask.tensor.squeeze().to(device).float()
+
+        self.coverage_map = torch.zeros_like(self.mask).to(device)
+        self.spinhistory_map = torch.zeros_like(self.mask).to(device)
+
+    def update(self, slice_normal_canonical, slice_center_canonical, slice_thickness):
+        sigma = slice_thickness / 2.355
+        t = np.eye(4)
+        t[:3,3] = -(np.array(self.mask.shape)-1)/2
+        slice_distances = distance_to_slice_voxelgrid(
+            self.mask.shape,
+            torch.tensor(t).to(device).float(),
+            torch.tensor(slice_center_canonical).to(device).float(),
+            torch.tensor(slice_normal_canonical).to(device).float()
+        )
+        # intersection_volumes = ((slice_distances < 0)*self.mask, (slice_distances > 0)*self.mask)
+        # print(intersection_volumes[0].sum()/self.mask.tensor.sum(), intersection_volumes[1].sum()/self.mask.tensor.sum())
+        slice_psf = torch.exp(-0.5 * (slice_distances/sigma)**2) #* self.mask.tensor
+
+        self.coverage_map += slice_psf
+        self.spinhistory_map = slice_psf
+    
+    def save_coverage(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        map = self.coverage_map #* self.mask
+        coverage = nib.Nifti1Image(map.cpu().numpy(), self.affine)
+        nib.save(coverage, path)
+    
+    def save_spinhistory(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        map = self.spinhistory_map #* self.mask
+        coverage = nib.Nifti1Image(map.cpu().numpy(), self.affine)
+        nib.save(coverage, path)
+    
+    def save_mask(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        coverage = nib.Nifti1Image(self.mask.cpu().numpy(), self.affine)
+        nib.save(coverage, path)
+
+def pose_to_affine(params):
+    rx, ry, rz, tx, ty, tz = params
+    Rx = torch.stack([
+        torch.stack([torch.ones_like(rx),  torch.zeros_like(rx), torch.zeros_like(rx)]),
+        torch.stack([torch.zeros_like(rx), torch.cos(rx),        -torch.sin(rx)      ]),
+        torch.stack([torch.zeros_like(rx), torch.sin(rx),         torch.cos(rx)      ]),
+    ])
+
+    Ry = torch.stack([
+        torch.stack([ torch.cos(ry), torch.zeros_like(ry), torch.sin(ry)]),
+        torch.stack([ torch.zeros_like(ry), torch.ones_like(ry), torch.zeros_like(ry)]),
+        torch.stack([-torch.sin(ry), torch.zeros_like(ry), torch.cos(ry)]),
+    ])
+
+    Rz = torch.stack([
+        torch.stack([torch.cos(rz),  -torch.sin(rz), torch.zeros_like(rz)]),
+        torch.stack([torch.sin(rz),   torch.cos(rz), torch.zeros_like(rz)]),
+        torch.stack([torch.zeros_like(rz), torch.zeros_like(rz), torch.ones_like(rz)]),
+    ])
+
+    R = Rz @ Ry @ Rx
+    t = torch.stack([tx, ty, tz])
+
+    affine = torch.eye(4, device=params.device)
+    affine[:3, :3] = R
+    affine[:3,  3] = t
+
+    return affine
+
+def affine_to_grid(affine, shape):
+    D, H, W = shape
+    theta = affine[:3, :]
+    theta = theta.unsqueeze(0)
+    grid  = torch.nn.functional.affine_grid(theta, (1, 1, D, H, W), align_corners=True)
+    return grid
+
+def ncc_loss(x, y):
+    x = x.flatten()
+    y = y.flatten()
+    x = x - x.mean()
+    y = y - y.mean()
+    ncc = (x * y).sum() / (x.norm() * y.norm() + 1e-8)
+    return 1.0 - ncc
+
+class RigidRegistration:
+
+    def __init__(
+        self,
+        n_iters=50,
+        lr=1e-3,
+        device="cuda",
+    ):
+        self.n_iters = n_iters
+        self.lr      = lr
+        self.device  = device
+
+    @torch.no_grad()
+    def _sample(self, volume, grid):
+        return torch.nn.functional.grid_sample(
+            volume, grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+
+    def register(self, fixed, moving, init_affine=None):
+        shape  = fixed.shape
+        fixed  = fixed.float().unsqueeze(0).unsqueeze(0).to(self.device)
+        moving = moving.float().unsqueeze(0).unsqueeze(0).to(self.device)
+
+        # Residual 6-DoF initialized at zero (identity residual)
+        params = torch.zeros(6, device=self.device, requires_grad=True)
+        optimizer = torch.optim.Adam([params], lr=self.lr)
+
+        # Precompute base grid from NN affine
+        if init_affine is not None:
+            base_affine = init_affine.to(self.device)
+        else:
+            base_affine = torch.eye(4, device=self.device)
+
+        for _ in range(self.n_iters):
+            optimizer.zero_grad()
+
+            # Compose: residual on top of NN estimate
+            residual_affine = pose_to_affine(params)
+            full_affine      = residual_affine @ base_affine
+
+            grid   = affine_to_grid(full_affine, shape)
+            warped = torch.nn.functional.grid_sample(moving, grid, mode="bilinear",
+                                   padding_mode="zeros", align_corners=True)
+
+            loss = ncc_loss(fixed, warped)
+            loss.backward()
+            optimizer.step()
+
+        # Final warp without grad
+        with torch.no_grad():
+            residual_affine = pose_to_affine(params)
+            full_affine     = residual_affine @ base_affine
+            grid            = affine_to_grid(full_affine, shape)
+            warped          = torch.nn.functional.grid_sample(moving, grid, mode="bilinear",
+                                            padding_mode="zeros", align_corners=True)
+
+        return full_affine.detach(), warped.squeeze().detach()
+
+def minmax_normalize_2D(
+    img: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    img:  shape (C, H, W)
+    mask: shape (H, W), boolean
+    """
+
+    if img.ndim != 3:
+        raise ValueError(f"`img` must have shape (C, H, W), got {tuple(img.shape)}")
+
+    if mask is not None:
+        if mask.dtype != torch.bool:
+            raise TypeError(f"`mask` must be bool, got {mask.dtype}")
+        if mask.shape != img.shape[1:]:
+            raise ValueError(
+                f"`mask` shape must match image spatial shape. "
+                f"Got mask {tuple(mask.shape)} and image {tuple(img.shape)}"
+            )
+
+    channels_to_norm = img[:-1]
+
+    if mask is not None and mask.any():
+        values = channels_to_norm[:, mask]
+    else:
+        values = channels_to_norm[channels_to_norm > 0]
+
+    if values.numel() == 0:
+        raise ValueError("No nonzero values found for normalization")
+
+    img_min = torch.quantile(values, 0.0)
+    img_max = torch.quantile(values, 1.0)
+
+    normalized = (channels_to_norm - img_min) / (img_max - img_min + 1e-6)
+    normalized = torch.clamp(normalized, 0, 1)
+
+    return torch.cat([normalized, img[-1:]], dim=0)

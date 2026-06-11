@@ -15,7 +15,7 @@ from nnunet.network_architecture.neural_network import SegmentationNetwork
 
 class ConvNet(SegmentationNetwork):
     def __init__(self, input_irreps, output_irreps, diameter, num_radial_basis, steps, batch_norm='instance', n=2, n_downsample =2, equivariance = 'SO3',
-        lmax = 2, down_op = 'maxpool3d', stride = 2, scale =2,is_bias = True,scalar_upsampling=False,dropout_prob=0,cutoff=False, return_fmaps=False):
+        lmax = 2, down_op = 'maxpool3d', stride = 2, scale =2,is_bias = True, pseudo_pool='outer_product', vector_pool='norm_weighted', dropout_prob=0,cutoff=False, return_fmaps=False):
         """E3CNN Network Architecture
 
         Parameters
@@ -115,11 +115,11 @@ class ConvNet(SegmentationNetwork):
         self.out = Convolution(self.down.down_irreps_out[-1], output_irreps, irreps_sh, diameter,num_radial_basis,steps,cutoff=cutoff)
 
         if len(output_irreps.split(' + '))>1:
-            self.max_pool = AdaptiveDynamicPool3d('maxpool3d', Irreps(output_irreps.split(' + ')[0]))
-            self.norm_pool = AdaptiveDynamicPool3d('norm_weighted', Irreps(output_irreps.split(' + ')[1]))
+            self.pseudo_pool = AdaptiveDynamicPool3d(pseudo_pool, Irreps(output_irreps.split(' + ')[0]))
+            self.vector_pool = AdaptiveDynamicPool3d(vector_pool, Irreps(output_irreps.split(' + ')[1]))
         else:
-            self.max_pool = None
-            self.norm_pool = AdaptiveDynamicPool3d('norm_weighted', Irreps(output_irreps))
+            self.pseudo_pool = None
+            self.vector_pool = AdaptiveDynamicPool3d(vector_pool, Irreps(output_irreps))
 
         if is_bias:
             self.bias = nn.parameter.Parameter(torch.zeros(self.n_classes_scalar))
@@ -127,12 +127,12 @@ class ConvNet(SegmentationNetwork):
             self.register_parameter('bias', None)
     
     def pool(self, x):
-        if self.max_pool is not None:
-            max_pool = self.max_pool(x[:,:3])
-            norm_pool = self.norm_pool(x[:,3:])
-            return torch.cat([max_pool, norm_pool], dim=1)
+        if self.pseudo_pool is not None:
+            pseudo_pooled = self.pseudo_pool(x[:,:3])
+            vector_pooled = self.vector_pool(x[:,3:])
+            return torch.cat([pseudo_pooled, vector_pooled], dim=1)
         else:
-            return self.norm_pool(x)
+            return self.vector_pool(x)
 
 
     def forward(self, x, pool=True):
@@ -409,9 +409,11 @@ class AdaptiveDynamicPool3d(torch.nn.Module):
             out = max_pool3d(input, self.irreps, kernel_size, stride=kernel_size) #e3nn max_pool3d implementation
             #out = F.max_pool3d(input, self.kernel_size, stride=self.kernel_size) #non-equivariant pytorch implementation
         elif self.mode == 'average':
-            out = F.avg_pool3d(input, kernel_size, stride=kernel_size)
+            out = adaptive_avg_pool3d(input, self.irreps, kernel_size, stride=kernel_size)
         elif self.mode == 'norm_weighted':
             out = adaptive_norm_weighted_pool3d(input, self.irreps, kernel_size, stride=kernel_size)
+        elif self.mode == 'outer_product':
+            out = adaptive_outer_product_pool3d(input, self.irreps, kernel_size, stride=kernel_size)
 
         return out
 
@@ -504,13 +506,60 @@ def adaptive_norm_weighted_pool3d(input, irreps, kernel_size, stride):
             pooled = F.avg_pool3d(temp, kernel_size, stride=stride)
             cat_list.append(pooled)
         else:
-            #breakpoint()
             weights = temp.norm(dim=1).unsqueeze(1)
             weights = torch.ones_like(weights)
             weights = weights / (weights.sum(dim=(2,3,4), keepdims=True) + 1e-8)
             temp_norm = torch.nn.functional.normalize(temp, dim=1)
             pooled = torch.sum(weights*temp_norm, dim=(2,3,4), keepdims=True)
-            #pooled = F.avg_pool3d(weights*temp, kernel_size, stride=kernel_size)
+            cat_list.append(pooled)
+        start = end
+    return torch.cat(tuple(cat_list),dim = 1)
+
+def adaptive_avg_pool3d(input, irreps, kernel_size, stride):
+
+    assert input.shape[1] == irreps.dim, "Shape mismatch"
+    cat_list = []
+
+    start = 0
+    for i in irreps.ls:
+
+        end = start + 2*i+1
+        temp = input[:,start:end,...]
+        if i == 0:
+            pooled = F.avg_pool3d(temp, kernel_size, stride=stride)
+            cat_list.append(pooled)
+        else:
+            weights = temp.norm(dim=1).unsqueeze(1)
+            weights = torch.ones_like(weights)
+            weights = weights / (weights.sum(dim=(2,3,4), keepdims=True) + 1e-8)
+            pooled = torch.sum(weights*temp, dim=(2,3,4), keepdims=True)
+            cat_list.append(pooled)
+        start = end
+    return torch.cat(tuple(cat_list),dim = 1)
+
+def adaptive_outer_product_pool3d(input, irreps, kernel_size, stride):
+
+    assert input.shape[1] == irreps.dim, "Shape mismatch"
+    cat_list = []
+
+    start = 0
+    for i in irreps.ls:
+
+        end = start + 2*i+1
+        temp = input[:,start:end,...]
+        if i == 0:
+            pooled = F.avg_pool3d(temp, kernel_size, stride=stride)
+            cat_list.append(pooled)
+        else:
+            weights = temp.norm(dim=1).unsqueeze(1)
+            weights = torch.ones_like(weights)
+            weights = weights / (weights.sum(dim=(2,3,4), keepdims=True) + 1e-8)
+            temp_norm = torch.nn.functional.normalize(temp, dim=1)
+            outer_product = torch.einsum('bvxyz,bwxyz->bvwxyz',temp_norm, temp_norm)
+            weighted_outer_product = torch.einsum('bvxyz,bvwxyz->bvwxyz',weights,outer_product)
+            pooled_mats = torch.sum(weighted_outer_product, dim=(3,4,5), keepdims=True)
+            _, eigvecs = torch.linalg.eigh(pooled_mats[:,:,:,0,0,0])
+            pooled = eigvecs[:,:,2].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
             cat_list.append(pooled)
         start = end
     return torch.cat(tuple(cat_list),dim = 1)

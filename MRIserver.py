@@ -20,16 +20,6 @@ import utils, realtime_utils
 
 SocketServer.TCPServer.allow_reuse_address = True
 
-RAS2LPS = np.diag(np.array([-1.,-1.,1.]))
-LPS2SDCS = {
-    "SUP": np.diag(np.array([1.,-1.,-1.])), # supine
-    "LL": np.array([
-        [0., -1., 0.],
-        [-1., 0., 0.],
-        [0., 0., -1]
-    ]), # left lateral
-}
-
 
 class ThreadedTCPRequestHandler(SocketServer.BaseRequestHandler):
     def __init__(self, callback, infoclient, *args, **keys):
@@ -57,15 +47,16 @@ def process_data_callback(infoclient, sock):
 
 # img: nibabel object Nifti1Image
 def save_nifti(img, imgtype, save_location, uid, index):
+    os.makedirs(save_location, exist_ok=True)
     filename = os.path.join(save_location,
             '%s-%s-%05d.nii.gz' % (imgtype, uid.decode(), index))
     img.to_filename(filename)
 
-# img: nibabel object Nifti1Image
-def save_npy(img_arr, imgtype, save_location, uid, index):
+def save_npy(arr, imgtype, save_location, uid, index):
+    os.makedirs(save_location, exist_ok=True)
     filename = os.path.join(save_location,
             '%s-%s-%05d.npy' % (imgtype, uid.decode(), index))
-    np.save(filename, img_arr)
+    np.save(filename, arr)
 
 
 """
@@ -118,11 +109,14 @@ class ImageReceiver(Server):
         super().__init__('Image Receiver', args.host, args.port)
         self.host = args.host
         self.port = args.port
+        self.debug_mode = args.debug_mode
+        self.no_moco = args.no_moco
 
         self._is_running = None
         self._server = None
         self.imagestore = []
-        self.save_location = args.save_directory
+        self.output_dir = args.save_directory
+        self.subdirs = [os.path.join(self.output_dir, sd) for sd in ["navigators", "slices", "vsend_params", "for_debugging", "acquisition_state"]]
         self.current_uid = None
         self.current_series_hdr = None
         self.save_4d = args.four_dimensional
@@ -137,15 +131,17 @@ class ImageReceiver(Server):
         self.stack = None
 
         # init acquisition params
-        self.slice_thickness = 3.
-        self.ori = 'coronal'
-        self.patient_position = 'SUP'
-        self.num_slices = 32
-        self.slice_zs_ordered = np.arange(0,self.num_slices)*self.slice_thickness # - (self.slice_thickness-1)/2
+        self.slice_thickness = args.slice_thickness
+        self.TR = args.TR
+        self.ori = args.orientation
+        assert(self.ori in ['axial', 'sagittal', 'coronal'])
+        self.patient_position = args.position
+        self.num_slices = args.n_slices
+        self.slice_zs_ordered = np.arange(0,self.num_slices)*self.slice_thickness
         self.slice_zs_ordered -= self.slice_zs_ordered.mean()
         self.slice_zs = []
         self.anatomical_idxs = []
-        self.n_sweeps = 4
+        self.n_sweeps = args.n_interleave
         self.vnav0 = None
         for sweep in range(self.n_sweeps):
             self.anatomical_idxs += list(range(sweep, self.num_slices, self.n_sweeps))
@@ -153,20 +149,59 @@ class ImageReceiver(Server):
         print(self.anatomical_idxs)
         print(self.slice_zs)
         self.qa = 1.0
+        self.qas = np.array([0.]*self.num_slices)
 
         # init networks
-        unet_path = "models/unet_128.ckpt"
+        unet_path = args.unet_path
         self.unet = realtime_utils.init_unet(unet_path)
-        e3cnn_path = "models/e3cnn.pth"
+        e3cnn_path = args.e3cnn_path
         self.e3cnn = realtime_utils.init_e3cnn(e3cnn_path)
+        transformer_path = args.transformer_path
+        if transformer_path != "":
+            self.transformer = realtime_utils.init_transformer(transformer_path)
+        else:
+            self.transformer = None
+        self.pose_nets = (self.e3cnn, self.transformer)
+        iqa_cnn_path = args.iqa_cnn_path
+        self.iqa_cnn = realtime_utils.init_iqa_cnn(iqa_cnn_path)
         self.nav_FOV_center_send = np.array([0., 0., 0.])
-        for _ in range(5):
+        self.seg_curr = None
+        self.brain_volume = None
+        self.slice_normal = None
+        self.tracking_measurements = {'x': [], 'y': [], 'z': [], 't': [], 'brain_com': None, 'rot0': None, 'rot': None}
+
+        # START UP NETWORKS WITH INFERENCE ON DUMMY INPUTS
+        seg = None
+        volume = None
+        slice_normal = None
+        dummy_measurements = {'x': [], 'y': [], 'z': [], 't': [], 'brain_com': None, 'rot0': None, 'rot': None}
+        for startup_run in range(32):
             start1 = time()
-            dummy_img = nb.Nifti1Image(np.random.uniform(size=(54,54,20)), np.diag([6,6,6,1]))
-            _, img_input, pred_seg, _, _ = realtime_utils.run_unet(dummy_img, self.unet)
-            _ = realtime_utils.run_e3cnn(img_input, pred_seg, dummy_img.affine, self.e3cnn, 0, 'axial', dummy_img.affine[:3,3], LPS2SDCS[self.patient_position]@RAS2LPS)
+            # dummy_navigator = nb.Nifti1Image(np.random.uniform(size=(64,64,24)), np.diag([5.5,5.5,5.5,1]))
+            import glob
+            dummy_navigator = nb.load(sorted(glob.glob("experiments/in_utero/AFI2-133/30w/axial_002/navigators/vNav*"))[startup_run])
+            print(f"frame {startup_run}")
+            _, img_input, seg, _, _ = realtime_utils.brain_segmentation(dummy_navigator, self.unet, dummy_measurements, seg_prev=seg, volume=volume, slice_normal=slice_normal, debug_mode=self.debug_mode)
+            if volume is None:
+                volume = seg.tensor.sum()
+            end1 = time()
+            _ = realtime_utils.pose_estimation(
+                vnav_params={'image': img_input, 'mask': seg.tensor, 'affine': dummy_navigator.affine},
+                slice_params={'position': 0, 'orientation': 'axial'},
+                measurements=dummy_measurements,
+                pose_nets=self.pose_nets,
+                acquisition_params={'patient_position': self.patient_position, 'TR': self.TR},
+                debug_mode=self.debug_mode
+            )
             end2 = time()
-            print(f"Total time: {end2-start1}")
+            print(f"Total navigator processing time: {end2-start1}, {end1-start1}, {end2-end1}")
+            start1 = time()
+            dummy_slice = nb.load(sorted(glob.glob("experiments/in_utero/AFI2-133/30w/axial_002/slices/HASTE*"))[startup_run])
+            slice_normal = dummy_slice.affine[:3,2]
+            _ = realtime_utils.slice_qa(dummy_slice, seg, 0, self.iqa_cnn)
+            end1 = time()
+            print(f"Total slice processing time: {end1-start1}")
+
     
     def stop(self):
         self._server.shutdown()
@@ -236,7 +271,6 @@ class ImageReceiver(Server):
         self.slice_pos = self.slice_zs[self.counter_HASTE]
         self.anatomical_idx = self.anatomical_idxs[self.counter_HASTE]
 
-
         # validation
         if self.current_uid != hdr.seriesUID:
             #assert hdr.currentTR == 1
@@ -262,52 +296,96 @@ class ImageReceiver(Server):
                 self.imagestore.append(new_ei)
                 if vnav:
                     print(f"Received navigator #{self.counter_vNav:03}")
+
+                    # INITIALIZATION
                     if self.vnav0 is None:
                         self.vnav0 = new_ei
                     nav_FOV_center_curr = new_ei.affine[:3,3] - self.vnav0.affine[:3,3]
-                    pred_trans, img_input, pred_seg, brain_center_pred_scanner, proc_aff = realtime_utils.run_unet(new_ei, self.unet)
+
+                    # PREDICT BRAIN MASK
+                    pred_trans, img_input, self.seg_curr, brain_center_pred_scanner, proc_aff = realtime_utils.brain_segmentation(new_ei, self.unet, self.tracking_measurements, seg_prev=self.seg_curr, volume=self.brain_volume, slice_normal=self.slice_normal, debug_mode=self.debug_mode)
+                    if self.brain_volume is None:
+                        self.brain_volume = self.seg_curr.tensor.sum()
+
+                    # COMPUTE ABSOLUTE NAVIGATOR TRANSLATION TO SEND TO SCANNER
                     nav_FOV_center_prescribe = nav_FOV_center_curr + pred_trans
-                    self.nav_FOV_center_send = LPS2SDCS[self.patient_position]@RAS2LPS@nav_FOV_center_prescribe
+                    self.nav_FOV_center_send = utils.LPS2SDCS[self.patient_position]@utils.RAS2LPS@nav_FOV_center_prescribe
                     clip = 199.9
                     if np.linalg.norm(self.nav_FOV_center_send) > clip:
                         self.nav_FOV_center_send = self.nav_FOV_center_send / np.linalg.norm(self.nav_FOV_center_send) * clip
                     
-                    self.slice_rot_send, self.slice_trans_send, nav_rot_pred = realtime_utils.run_e3cnn(img_input, pred_seg, new_ei.affine, self.e3cnn, self.slice_pos, self.ori, brain_center_pred_scanner, LPS2SDCS[self.patient_position]@RAS2LPS)
+                    # PREDICT ROTATION
+                    self.tracking_measurements['brain_com'] = brain_center_pred_scanner
+                    pose_output = realtime_utils.pose_estimation(
+                        vnav_params={'image': img_input, 'mask': self.seg_curr.tensor, 'affine': new_ei.affine},
+                        slice_params={'position': self.slice_pos, 'orientation': self.ori},
+                        measurements=self.tracking_measurements,
+                        pose_nets=self.pose_nets,
+                        acquisition_params={'patient_position': self.patient_position, 'TR': self.TR},
+                        debug_mode=self.debug_mode
+                    )
+                    self.slice_rot_send, self.slice_trans_send, self.slice_rot_scanner, self.slice_center_scanner, self.slice_rot_head, self.slice_trans_head, nav_rot_pred = pose_output
+                    self.slice_normal = self.slice_rot_scanner[:3,2]
+
+                    # SEND NAVIGATOR FOV + SLICE PRESCRIPTION PARAMETERS TO SCANNER
                     result = tuple(self.nav_FOV_center_send.tolist() + self.slice_trans_send.tolist() + self.slice_rot_send.flatten().tolist() + [self.qa])
                     self.shared_data.put("vNav", (result, self.counter_vNav))
-                    
 
-                    save_nifti(nb.Nifti1Image(img_input.detach().cpu().squeeze().numpy(), proc_aff), "INPUT", self.save_location, hdr.seriesUID, self.counter_vNav)
-                    save_nifti(nb.Nifti1Image(pred_seg.float().detach().cpu().squeeze().numpy(), proc_aff), "MASK", self.save_location, hdr.seriesUID, self.counter_vNav)
-                    save_npy(nav_FOV_center_prescribe, 'nav_FOV_scanner', self.save_location, hdr.seriesUID, self.counter_vNav)
-                    save_npy(self.nav_FOV_center_send, 'nav_FOV_send', self.save_location, hdr.seriesUID, self.counter_vNav)
-                    save_npy(nav_rot_pred, 'nav_rot_pred', self.save_location, hdr.seriesUID, self.counter_vNav)
-                    save_npy(self.slice_rot_send, 'slice_rot_send', self.save_location, hdr.seriesUID, self.counter_vNav)
-                    save_npy(self.slice_trans_send, 'slice_trans_send', self.save_location, hdr.seriesUID, self.counter_vNav)
-                    save_nifti(new_ei, imgtype, self.save_location, hdr.seriesUID, self.counter_vNav)
+                    # INITIALIZE ACQUISITION STATE
+                    if self.counter_vNav == 0:
+                        self.acquisition_state = utils.AcquisitionState(self.seg_curr, nav_rot_pred)
+                        self.acquisition_state.save_mask(os.path.join(self.subdirs[4], f"mask.nii.gz"))
+                    # UPDATE ACQUISITION STATE
+                    self.acquisition_state.update(
+                        slice_normal_canonical=self.slice_rot_head[:3,2],
+                        slice_center_canonical=self.slice_trans_head,
+                        slice_thickness=self.slice_thickness
+                    )
+
+                    # SAVE FILES FOR DEBUGGING
+                    save_nifti(nb.Nifti1Image(img_input.detach().cpu().squeeze().numpy(), proc_aff), "INPUT", self.subdirs[3], hdr.seriesUID, self.counter_vNav)
+                    save_nifti(nb.Nifti1Image(self.seg_curr.tensor.float().detach().cpu().squeeze().numpy(), proc_aff), "MASK", self.subdirs[3], hdr.seriesUID, self.counter_vNav)
+                    save_npy(nav_FOV_center_prescribe, 'nav_FOV_scanner', self.subdirs[3], hdr.seriesUID, self.counter_vNav)
+                    save_npy(self.nav_FOV_center_send, 'nav_FOV_send', self.subdirs[2], hdr.seriesUID, self.counter_vNav)
+                    save_npy(nav_rot_pred, 'nav_rot_pred', self.subdirs[3], hdr.seriesUID, self.counter_vNav)
+                    save_npy(self.slice_rot_send, 'slice_rot_send', self.subdirs[2], hdr.seriesUID, self.counter_vNav)
+                    save_npy(self.slice_trans_send, 'slice_trans_send', self.subdirs[2], hdr.seriesUID, self.counter_vNav)
+                    save_nifti(new_ei, imgtype, self.subdirs[0], hdr.seriesUID, self.counter_vNav)
+
+                    # SAVE STATE OUTPUTS
+                    self.acquisition_state.save_coverage(os.path.join(self.subdirs[4], f"coverage_{self.counter_vNav:03}.nii.gz"))
+                    self.acquisition_state.save_spinhistory(os.path.join(self.subdirs[4], f"spin_history_{self.counter_vNav:03}.nii.gz"))
+
+                    # UPDATE VNAV FRAME
                     self.counter_vNav += 1
                     
                 else:
                     print(f"Received slice #{self.counter_HASTE:03}")
                     if hdr.iSliceAnatomicalIndex == 0:
                         self.stack_affine = new_ei.affine
-                    self.stack[hdr.iSliceAnatomicalIndex] = new_ei.get_fdata().squeeze()
-                    self.qa = realtime_utils.run_qa_cnn(new_ei, self.slice_pos)
+                    if self.no_moco:
+                        anatomical_idx = hdr.iSliceAnatomicalIndex
+                    else:
+                        anatomical_idx = self.anatomical_idx
+                    self.stack[anatomical_idx] = new_ei.get_fdata().squeeze()
 
-                    voxel_res = np.diag([1.25,1.25,3])
-                    prescribed_aff = new_ei.affine
-                    new_slice_rot, new_slice_center = utils.vsend_to_scanner(self.slice_rot_send, self.slice_trans_send, np.copy(prescribed_aff[:3,:3]), LPS2SDCS[self.patient_position]@RAS2LPS)
-                    new_slice_rot = new_slice_rot @ voxel_res
-                    new_slice_aff = utils.adjust_slice_t(new_ei, new_slice_rot, new_slice_center)
-                    new_ei = nb.Nifti1Image(new_ei.get_fdata(), new_slice_aff)
+                    voxel_dims = np.linalg.norm(new_ei.affine[:3,:3], axis=0)
+                    new_slice_rot = self.slice_rot_scanner @ np.diag(voxel_dims)
+                    new_slice_aff = utils.adjust_slice_t(new_ei, new_slice_rot, self.slice_center_scanner)
+                    
+                    if not self.no_moco:
+                        new_ei = nb.Nifti1Image(new_ei.get_fdata(), new_slice_aff)
+                        
+                    self.qa = realtime_utils.slice_qa(new_ei, self.seg_curr, self.slice_pos, self.iqa_cnn)[0]
+                    self.qas[anatomical_idx] = self.qa
+                    save_nifti(new_ei, imgtype, self.subdirs[1], hdr.seriesUID, self.counter_HASTE)
                     self.counter_HASTE += 1
-                    save_nifti(new_ei, imgtype, self.save_location, hdr.seriesUID, self.counter_HASTE)
-                # save_npy(new_ei.get_fdata(), imgtype, self.save_location, hdr.seriesUID, self.counter_vNav)
 
 
             if len(self.stack) == sum([x is not None for x in self.stack]):
                 self.stack = np.stack(self.stack, axis=-1)
-                save_nifti(nb.Nifti1Image(self.stack, self.stack_affine), "STACK", self.save_location, hdr.seriesUID, self.counter_vNav)
+                save_nifti(nb.Nifti1Image(self.stack, self.stack_affine), "STACK", self.subdirs[1], hdr.seriesUID, 0)
+                save_npy(self.qas, 'slice_QA', self.subdirs[1], hdr.seriesUID, 0)
             if hdr.currentTR + 1 == hdr.totalTR:
                 if self.save_4d:
                     self.save_imagestore()
@@ -333,9 +411,9 @@ class VNavDataSender(Server):
         sendstr = '%f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f' % (res[0])
        
         if len(sendstr):
-            # print('Sending String: ', sendstr)
+            print('Sending String: ', sendstr)
             sock.send(str.encode(sendstr))
-            # print("time send result: %f" % (time() - time_start))
+            print("time send result: %f" % (time() - time_start))
         else:
             print('empty queue')
 
@@ -369,6 +447,23 @@ def parse_args(args):
                         help="Directory to save images and labels to.")
     parser.add_argument("-fd", "--four_dimensional", action="store_true")
     parser.add_argument("-ss", "--single_series", action="store_false")
+    parser.add_argument("-dm", "--debug_mode", action="store_true")
+    parser.add_argument("-nm", "--no_moco", action="store_true")
+    parser.add_argument("-usn", "--use_sequence_network", action="store_true")
+
+    # ACQUISITION PARAMETERS
+    parser.add_argument("--slice_thickness", type=float, default=3., help="slice thickness in mm")
+    parser.add_argument("--TR", type=float, default=2.5, help="TR in seconds (time interval between consecutive slices)")
+    parser.add_argument("--orientation", type=str, default="axial", help="desired anatomical orientation (axial, sagittal, coronal)")
+    parser.add_argument("--position", type=str, default="SUP", help="patient position in scanner (SUP for supine, LL for left-lateral)")
+    parser.add_argument("--n_slices", type=int, default=32, help="number of slices in stack")
+    parser.add_argument("--n_interleave", type=int, default=4, help="number of slices to interleave by")
+
+    # NETWORKS
+    parser.add_argument("--unet_path", type=str, default="models/unet_128.ckpt", help="path to segmentation U-Net weights")
+    parser.add_argument("--e3cnn_path", type=str, default="models/e3cnn_uncertainty.pth", help="path to rotation E(3)-CNN weights")
+    parser.add_argument("--transformer_path", type=str, default="", help="path to temporal transformer weights")
+    parser.add_argument("--iqa_cnn_path", type=str, default="models/iqa.pth", help="path to 2D IQA CNN weights")
 
     return parser.parse_args()
 
